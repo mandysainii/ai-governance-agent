@@ -140,12 +140,14 @@ class PolicyResearchAgent:
 
         for _ in range(self.max_iterations):
             result.iterations += 1
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.system_prompt,
-                tools=TOOL_SCHEMAS,
-                messages=messages,
+            response = config.call_with_retry(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    system=self.system_prompt,
+                    tools=TOOL_SCHEMAS,
+                    messages=messages,
+                )
             )
             result.input_tokens += response.usage.input_tokens
             result.output_tokens += response.usage.output_tokens
@@ -177,11 +179,39 @@ class PolicyResearchAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
+        # Iteration cap reached without a final answer. Rather than give up,
+        # force a final synthesis turn WITHOUT tools so the model must write its
+        # answer from the evidence already gathered (fixes low scores where the
+        # right chunks were retrieved but the loop ran out of tool-call budget).
         if not result.answer:
-            result.answer = (
-                "I was unable to complete this request within the allotted "
-                "reasoning steps. Please try rephrasing or narrowing the question."
+            result.answer = self._force_final_anthropic(messages, result)
+
+    _FINAL_SYNTHESIS_NUDGE = (
+        "You have gathered sufficient evidence from the tools above. Do NOT "
+        "call any more tools. Using only that retrieved evidence, write your "
+        "complete final answer now, citing the source documents by name. If the "
+        "evidence does not fully cover the question, answer with what it does "
+        "support and say what is missing."
+    )
+
+    def _force_final_anthropic(self, messages: list[dict[str, Any]], result: AgentResult) -> str:
+        """Make one tool-free call so the model commits to a final answer."""
+        messages.append({"role": "user", "content": self._FINAL_SYNTHESIS_NUDGE})
+        response = config.call_with_retry(
+            lambda: self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=self.system_prompt,
+                messages=messages,
             )
+        )
+        result.input_tokens += response.usage.input_tokens
+        result.output_tokens += response.usage.output_tokens
+        result.stop_reason = response.stop_reason
+        answer = "".join(b.text for b in response.content if b.type == "text")
+        if answer:
+            result.transcript.append({"role": "assistant", "text": answer})
+        return answer
 
     # ------------------------------------------------------------------ #
     # OpenAI-compatible path (Databricks + londonary + any llama.cpp server)
@@ -194,12 +224,14 @@ class PolicyResearchAgent:
 
         for _ in range(self.max_iterations):
             result.iterations += 1
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=messages,
-                tools=self._openai_tools,
-                tool_choice="auto",
+            response = config.call_with_retry(
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    messages=messages,
+                    tools=self._openai_tools,
+                    tool_choice="auto",
+                )
             )
             self._accumulate_openai_usage(result, response)
             choice = response.choices[0]
@@ -238,11 +270,28 @@ class PolicyResearchAgent:
                 result.transcript.append({"role": "tool", "name": tc.function.name, "input": args})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
+        # Iteration cap reached — force a tool-free final synthesis turn rather
+        # than giving up (see _run_anthropic for rationale).
         if not result.answer:
-            result.answer = (
-                "I was unable to complete this request within the allotted "
-                "reasoning steps. Please try rephrasing or narrowing the question."
+            result.answer = self._force_final_openai(messages, result)
+
+    def _force_final_openai(self, messages: list[dict[str, Any]], result: AgentResult) -> str:
+        """Make one tool-free call so the model commits to a final answer."""
+        messages.append({"role": "user", "content": self._FINAL_SYNTHESIS_NUDGE})
+        response = config.call_with_retry(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=messages,
             )
+        )
+        self._accumulate_openai_usage(result, response)
+        choice = response.choices[0]
+        result.stop_reason = choice.finish_reason
+        answer = _THINK_RE.sub("", _content_to_str(choice.message.content)).strip()
+        if answer:
+            result.transcript.append({"role": "assistant", "text": answer})
+        return answer
 
     # ------------------------------------------------------------------ #
     # Fallback: retrieve in code, single grounded completion (no tool calls)
@@ -265,13 +314,15 @@ class PolicyResearchAgent:
             "policy/governance, politely decline.\n\n"
             f"PASSAGES:\n{context}\n\nQUESTION: {query}"
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user},
-            ],
+        response = config.call_with_retry(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user},
+                ],
+            )
         )
         self._accumulate_openai_usage(result, response)
         choice = response.choices[0]

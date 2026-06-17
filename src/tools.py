@@ -18,6 +18,7 @@ the retrieval logic and schemas were reviewed by the author.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import numpy as np
@@ -111,6 +112,107 @@ class PolicyToolbox:
         except KeyError as exc:  # missing required argument
             return f"Error: missing required argument {exc} for tool '{tool_name}'."
         except Exception as exc:  # defensive: never crash the agent loop
+            return f"Error while running tool '{tool_name}': {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Databricks Vector Search toolbox — no local embedder or numpy store needed.
+# The VS index (created in 01_data_pipeline.ipynb) handles embeddings itself.
+# --------------------------------------------------------------------------- #
+
+# Maps config doc_id values to the 'source' column written by the pipeline.
+_DOC_ID_TO_SOURCE = {
+    "nist_ai_rmf_1_0": "nist_ai_rmf",
+    "nist_ai_600_1":   "nist_ai_600_1",
+    "eu_ai_act":       "eu_ai_act",
+}
+_SOURCE_TO_DOC_ID = {v: k for k, v in _DOC_ID_TO_SOURCE.items()}
+
+
+class DatabricksVSToolbox:
+    """PolicyToolbox backed by Databricks Vector Search.
+
+    Pass the live VS index object (from VectorSearchClient.get_index()).
+    No SentenceTransformer or .npz file required — the index embeds queries
+    internally using the model it was built with (databricks-bge-large-en).
+    """
+
+    def __init__(self, vs_index: Any) -> None:
+        self.vs_index = vs_index
+
+    def _search_raw(
+        self, query: str, top_k: int, source_filter: str | None = None
+    ) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "query_text": query,
+            "columns": ["source", "text"],
+            "num_results": top_k,
+        }
+        if source_filter:
+            kwargs["filters_json"] = json.dumps({"source": source_filter})
+        result = self.vs_index.similarity_search(**kwargs)
+        rows = result.get("result", {}).get("data_array", [])
+        return [
+            {
+                "doc_id": _SOURCE_TO_DOC_ID.get(r[0], r[0]),
+                "text": r[1],
+                "score": r[2] if len(r) > 2 else 0.0,
+            }
+            for r in rows
+        ]
+
+    @staticmethod
+    def _format_hits(hits: list[dict[str, Any]]) -> str:
+        if not hits:
+            return "No relevant passages were found in the knowledge base."
+        lines: list[str] = []
+        for i, h in enumerate(hits, start=1):
+            src = config.DOC_SHORT_NAMES.get(h.get("doc_id", ""), h.get("doc_id", "?"))
+            score = h.get("score")
+            score_str = f" (similarity={score:.3f})" if score else ""
+            lines.append(f"[{i}] Source: {src}{score_str}\n{h['text'].strip()}")
+        return "\n\n".join(lines)
+
+    def search_policy_documents(self, query: str, top_k: int | None = None) -> str:
+        hits = self._search_raw(query, top_k or config.TOP_K_RESULTS)
+        return self._format_hits(hits)
+
+    def compare_frameworks(self, topic: str, doc_id_a: str, doc_id_b: str) -> str:
+        per_doc = max(2, config.TOP_K_RESULTS // 2)
+        src_a = _DOC_ID_TO_SOURCE.get(doc_id_a, doc_id_a)
+        src_b = _DOC_ID_TO_SOURCE.get(doc_id_b, doc_id_b)
+        hits_a = self._search_raw(topic, per_doc, source_filter=src_a)
+        hits_b = self._search_raw(topic, per_doc, source_filter=src_b)
+        name_a = config.DOC_SHORT_NAMES.get(doc_id_a, doc_id_a)
+        name_b = config.DOC_SHORT_NAMES.get(doc_id_b, doc_id_b)
+        return (
+            f"=== {name_a} on '{topic}' ===\n{self._format_hits(hits_a)}\n\n"
+            f"=== {name_b} on '{topic}' ===\n{self._format_hits(hits_b)}"
+        )
+
+    def summarize_policy_topic(self, topic: str) -> str:
+        hits = self._search_raw(topic, config.TOP_K_RESULTS + 2)
+        return self._format_hits(hits)
+
+    def dispatch(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        try:
+            if tool_name == "search_policy_documents":
+                return self.search_policy_documents(
+                    query=tool_input["query"],
+                    top_k=tool_input.get("top_k"),
+                )
+            if tool_name == "compare_frameworks":
+                return self.compare_frameworks(
+                    topic=tool_input["topic"],
+                    doc_id_a=tool_input["doc_id_a"],
+                    doc_id_b=tool_input["doc_id_b"],
+                )
+            if tool_name == "summarize_policy_topic":
+                return self.summarize_policy_topic(topic=tool_input["topic"])
+            return f"Error: unknown tool '{tool_name}'."
+        except KeyError as exc:
+            return f"Error: missing required argument {exc} for tool '{tool_name}'."
+        except Exception as exc:
             return f"Error while running tool '{tool_name}': {exc}"
 
 

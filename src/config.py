@@ -49,7 +49,6 @@ DOCUMENTS = [
         "doc_id": "eu_ai_act",
         "title": "EU Artificial Intelligence Act (Regulation 2024/1689)",
         "short_name": "EU AI Act",
-        # Official Journal consolidated text (PDF).
         "url": "https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=OJ:L_202401689",
         "publisher": "European Union",
         "year": 2024,
@@ -77,37 +76,97 @@ VECTOR_STORE_PATH = VECTOR_STORE_DIR / "policy_store.npz"
 VECTOR_STORE_META_PATH = VECTOR_STORE_DIR / "policy_store_meta.json"
 
 # --------------------------------------------------------------------------- #
-# Models — TWO Claude models are used so the evaluation can compare them.
-# Pricing (per 1M tokens) is recorded here for the ROI calculation.
+# Anthropic models — used only if ANTHROPIC_API_KEY is set.
 # --------------------------------------------------------------------------- #
-PRIMARY_MODEL = "claude-sonnet-4-6"            # higher capability, higher cost
-SECONDARY_MODEL = "claude-haiku-4-5-20251001"  # faster + cheaper, for ROI compare
-JUDGE_MODEL = "claude-sonnet-4-6"              # LLM-as-judge scorer
+PRIMARY_MODEL = "claude-sonnet-4-6"
+SECONDARY_MODEL = "claude-haiku-4-5-20251001"
 
 # USD per 1,000,000 tokens. Source: Anthropic pricing (cached 2026-05).
+# Databricks and self-hosted endpoints have $0 marginal per-token cost.
 MODEL_PRICING = {
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
 
 # --------------------------------------------------------------------------- #
-# Open-source model (3rd comparison point) — a Qwen3 model self-hosted on a
-# llama.cpp `llama-server`, reached via its OpenAI-compatible API.
-# Self-hosted => marginal per-token cost is effectively $0 (you pay for GPU
-# time, not per token). estimate_cost() returns 0 for any model not listed in
-# MODEL_PRICING, which is exactly what we want here. Set the constants below
-# (or the matching env vars) to point at your server.
+# Databricks endpoints — two OSS models for the head-to-head comparison.
+# Override via env vars if your workspace uses different endpoint names.
+# --------------------------------------------------------------------------- #
+DATABRICKS_PRIMARY_ENDPOINT = os.environ.get(
+    "DATABRICKS_PRIMARY_ENDPOINT", "databricks-gpt-oss-120b"
+)
+DATABRICKS_SECONDARY_ENDPOINT = os.environ.get(
+    "DATABRICKS_SECONDARY_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
+)
+
+# --------------------------------------------------------------------------- #
+# Open-source model — Qwen 3.6 self-hosted at llm.londonary.com, reached via
+# its OpenAI-compatible API. Marginal per-token cost is effectively $0.
 # --------------------------------------------------------------------------- #
 OPENSOURCE_BASE_URL = os.environ.get(
     "OPENSOURCE_BASE_URL", "https://llm.londonary.com/v1"
 )
-# Leave empty to auto-discover the model id from the server's /v1/models.
 OPENSOURCE_MODEL = os.environ.get("OPENSOURCE_MODEL", "")
-# Optional: amortized infra cost ($/hour for the GPU host) for an infra-based
-# ROI angle. 0.0 => treat the open-source model's marginal cost as free.
 OPENSOURCE_INFRA_USD_PER_HOUR = float(
     os.environ.get("OPENSOURCE_INFRA_USD_PER_HOUR", "0.0")
 )
+
+# --------------------------------------------------------------------------- #
+# Judge configuration.
+# Prefer Anthropic (higher accuracy for scoring). Fall back to the primary
+# Databricks endpoint if ANTHROPIC_API_KEY is not set.
+# --------------------------------------------------------------------------- #
+_has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+JUDGE_MODEL = PRIMARY_MODEL if _has_anthropic else DATABRICKS_PRIMARY_ENDPOINT
+JUDGE_BACKEND: str = "anthropic" if _has_anthropic else "databricks"
+
+# --------------------------------------------------------------------------- #
+# LLM Registry — OSS-first. Anthropic entries added only when key is present.
+#
+# Each entry must have:
+#   label   — human-readable name shown in tables and charts
+#   backend — "anthropic" | "databricks" | "openai_compat"
+#
+# Backend-specific keys:
+#   anthropic     → model  (Anthropic model ID)
+#   databricks    → endpoint  (Databricks serving endpoint name)
+#   openai_compat → (reads OPENSOURCE_BASE_URL / OPENSOURCE_MODEL from env)
+# --------------------------------------------------------------------------- #
+LLM_REGISTRY: dict = {
+    "db_primary": {
+        "label": f"Databricks / {DATABRICKS_PRIMARY_ENDPOINT}",
+        "backend": "databricks",
+        "endpoint": DATABRICKS_PRIMARY_ENDPOINT,
+    },
+    "db_secondary": {
+        "label": f"Databricks / {DATABRICKS_SECONDARY_ENDPOINT}",
+        "backend": "databricks",
+        "endpoint": DATABRICKS_SECONDARY_ENDPOINT,
+    },
+    "opensource": {
+        "label": "Qwen 3.6 (llm.londonary.com)",
+        "backend": "openai_compat",
+    },
+}
+
+if _has_anthropic:
+    LLM_REGISTRY["sonnet"] = {
+        "label": "Claude Sonnet 4.6",
+        "backend": "anthropic",
+        "model": PRIMARY_MODEL,
+    }
+    LLM_REGISTRY["haiku"] = {
+        "label": "Claude Haiku 4.5",
+        "backend": "anthropic",
+        "model": SECONDARY_MODEL,
+    }
+
+# Keys used for the head-to-head trace. Both Databricks models + londonary run
+# always; Claude is added when the key is available.
+EVAL_HEAD_TO_HEAD_KEYS: list = ["db_primary", "db_secondary", "opensource"]
+if _has_anthropic:
+    EVAL_HEAD_TO_HEAD_KEYS.append("sonnet")
 
 # --------------------------------------------------------------------------- #
 # Agent behavior.
@@ -160,11 +219,65 @@ def get_api_key() -> str:
     return key
 
 
+def get_databricks_client():
+    """Return an OpenAI-compatible client backed by Databricks Model Serving.
+
+    The Databricks SDK reads DATABRICKS_HOST and DATABRICKS_TOKEN from the
+    environment (or ~/.databrickscfg) automatically.
+    """
+    try:
+        from databricks.sdk import WorkspaceClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "databricks-sdk is not installed. Run: pip install databricks-sdk"
+        ) from exc
+    wc = WorkspaceClient()
+    return wc.serving_endpoints.get_open_ai_client()
+
+
+def get_judge_client():
+    """Return the client used by the LLM judge.
+
+    Returns an Anthropic client when ANTHROPIC_API_KEY is set; otherwise
+    returns a Databricks OpenAI-compatible client so the judge runs on
+    the primary OSS endpoint with no API key required.
+    """
+    if JUDGE_BACKEND == "anthropic":
+        import anthropic
+        return anthropic.Anthropic(api_key=get_api_key())
+    return get_databricks_client()
+
+
+def create_agent(key: str, toolbox):
+    """Instantiate a PolicyResearchAgent for the given LLM registry key."""
+    from .agent import PolicyResearchAgent
+    entry = LLM_REGISTRY[key]
+    backend = entry["backend"]
+
+    if backend == "anthropic":
+        return PolicyResearchAgent(toolbox, model=entry["model"], backend="anthropic")
+
+    if backend == "databricks":
+        return PolicyResearchAgent(
+            toolbox,
+            client=get_databricks_client(),
+            model=entry["endpoint"],
+            backend="databricks",
+        )
+
+    if backend == "openai_compat":
+        from openai import OpenAI
+        client = OpenAI(base_url=OPENSOURCE_BASE_URL, api_key=get_opensource_api_key())
+        return PolicyResearchAgent(toolbox, client=client, backend="openai_compat")
+
+    raise ValueError(f"Unknown backend '{backend}' for key '{key}'")
+
+
 def get_opensource_api_key() -> str:
     """Return the API key for the open-source/llama.cpp server.
 
-    Many local llama.cpp deployments require no key; the OpenAI SDK still needs
-    a non-empty string, so we fall back to a harmless placeholder.
+    Many local deployments require no key; the OpenAI SDK still needs a
+    non-empty string, so we fall back to a harmless placeholder.
     """
     return (
         os.environ.get("OPENSOURCE_API_KEY")
@@ -177,7 +290,7 @@ def resolve_opensource_model(client) -> str:
     """Return the open-source model id, auto-discovering it if not configured.
 
     If OPENSOURCE_MODEL is set we trust it. Otherwise we ask the server which
-    models it serves (``GET /v1/models``) and take the first one.
+    models it serves (GET /v1/models) and take the first one.
     """
     if OPENSOURCE_MODEL:
         return OPENSOURCE_MODEL
@@ -188,5 +301,4 @@ def resolve_opensource_model(client) -> str:
             return ids[0]
     except Exception:
         pass
-    # Last resort: a sensible default. Override via OPENSOURCE_MODEL if wrong.
-    return "qwen3"
+    return "qwen3.6"

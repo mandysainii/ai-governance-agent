@@ -18,10 +18,22 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-import anthropic
-
 from . import config
 from .agent import AgentResult
+
+
+def _content_to_str(content) -> str:
+    """Normalize OpenAI message content to a plain string (handles list blocks)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
 
 # --------------------------------------------------------------------------- #
 # Evaluation query set.
@@ -117,27 +129,49 @@ class JudgeScore:
 
 
 def judge_response(
-    client: anthropic.Anthropic,
+    client,
     query: str,
     answer: str,
     category: str,
     judge_model: str = config.JUDGE_MODEL,
+    backend: str = config.JUDGE_BACKEND,
 ) -> JudgeScore:
-    """Score one agent answer with the LLM judge. Returns a JudgeScore."""
+    """Score one agent answer with the LLM judge. Returns a JudgeScore.
+
+    Accepts either an Anthropic client (backend='anthropic') or an
+    OpenAI-compatible client (backend='databricks' or 'openai_compat').
+    """
     user_block = (
         f"USER QUESTION (category: {category}):\n{query}\n\n"
         f"ASSISTANT RESPONSE:\n{answer}\n\n"
         "Score the response now. Return only the JSON object."
     )
-    response = client.messages.create(
-        model=judge_model,
-        max_tokens=512,
-        system=_JUDGE_SYSTEM,
-        messages=[{"role": "user", "content": user_block}],
-    )
-    raw = "".join(b.text for b in response.content if b.type == "text")
-    data = _extract_json(raw)
 
+    if backend == "anthropic":
+        response = client.messages.create(
+            model=judge_model,
+            max_tokens=512,
+            system=_JUDGE_SYSTEM,
+            messages=[{"role": "user", "content": user_block}],
+        )
+        raw = "".join(b.text for b in response.content if b.type == "text")
+        in_tok = response.usage.input_tokens
+        out_tok = response.usage.output_tokens
+    else:
+        response = client.chat.completions.create(
+            model=judge_model,
+            max_tokens=512,
+            messages=[
+                {"role": "system", "content": _JUDGE_SYSTEM},
+                {"role": "user", "content": user_block},
+            ],
+        )
+        raw = _content_to_str(response.choices[0].message.content)
+        usage = getattr(response, "usage", None)
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+
+    data = _extract_json(raw)
     dims = ["accuracy", "relevance", "completeness", "clarity"]
     scores = {d: int(data.get(d, 0)) for d in dims}
     overall = data.get("overall")
@@ -147,8 +181,8 @@ def judge_response(
         **scores,
         overall=float(overall),
         rationale=str(data.get("rationale", "")),
-        judge_input_tokens=response.usage.input_tokens,
-        judge_output_tokens=response.usage.output_tokens,
+        judge_input_tokens=in_tok,
+        judge_output_tokens=out_tok,
     )
 
 

@@ -1,32 +1,54 @@
-"""PolicyResearchAgent — a ReAct agent over the Anthropic tool_use API.
+"""PolicyResearchAgent — a ReAct agent supporting Anthropic and OpenAI-compatible backends.
 
-The ReAct pattern (Reason + Act) is implemented natively by Claude's tool_use
-loop: Claude reasons about the question, calls one of the three policy tools,
-reads the tool result, and repeats until it has enough evidence to give a final
-answer. This module runs that loop manually so we can:
-  * cap the number of iterations (out-of-scope / runaway protection),
-  * record every step for inspection, and
-  * let Phoenix/OpenTelemetry trace each Anthropic call.
+Supports three backends via a single class:
+  - "anthropic"    : Anthropic Messages API (Claude models)
+  - "openai_compat": Any OpenAI-compatible endpoint (llm.londonary.com, llama.cpp, etc.)
+  - "databricks"   : Databricks Model Serving (OpenAI-compatible wire protocol)
 
-AI-USAGE NOTE: The loop structure follows the Anthropic SDK's documented manual
-agentic-loop pattern; it was drafted with Claude Code and reviewed by the author.
+The ReAct loop (Reason + Act) runs natively via each provider's tool/function-
+calling API. If function calling is unavailable (some local servers don't support
+it), the openai_compat path falls back to retrieval-augmented single-shot.
+
+AI-USAGE NOTE: drafted with Claude Code assistance; reviewed by the author.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import anthropic
-
 from . import config
 from .tools import TOOL_SCHEMAS, PolicyToolbox
+
+# Qwen3 and other reasoning models may emit <think>...</think> blocks.
+# Strip them from the final answer; the judge scores only the visible text.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _content_to_str(content: Any) -> str:
+    """Normalize an OpenAI message content to a plain string.
+
+    Some endpoints return content as a list of typed blocks rather than a
+    plain string. This handles both forms safely.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
 
 
 @dataclass
 class AgentResult:
-    """Everything produced by one agent run — handy for evaluation + traces."""
+    """Everything produced by one agent run — used for evaluation and tracing."""
 
     query: str
     model: str
@@ -40,30 +62,81 @@ class AgentResult:
     transcript: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _to_openai_tools(schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate Anthropic-style tool schemas to OpenAI 'function' tools."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": s["name"],
+                "description": s["description"],
+                "parameters": s["input_schema"],
+            },
+        }
+        for s in schemas
+    ]
+
+
 class PolicyResearchAgent:
-    """Runs the ReAct tool loop for one model against the policy toolbox."""
+    """ReAct agent that works across Anthropic, Databricks, and OpenAI-compatible backends."""
 
     def __init__(
         self,
-        toolbox: PolicyToolbox,
-        client: anthropic.Anthropic | None = None,
+        toolbox,
+        client: Any | None = None,
         model: str = config.PRIMARY_MODEL,
+        backend: str = "anthropic",
         system_prompt: str = config.SYSTEM_PROMPT,
         max_iterations: int = config.MAX_AGENT_ITERATIONS,
         max_tokens: int = config.MAX_TOKENS,
     ) -> None:
         self.toolbox = toolbox
-        self.client = client or anthropic.Anthropic(api_key=config.get_api_key())
         self.model = model
+        self.backend = backend
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
 
+        if client is None:
+            if backend == "anthropic":
+                import anthropic
+                client = anthropic.Anthropic(api_key=config.get_api_key())
+            else:
+                from openai import OpenAI
+                client = OpenAI(
+                    base_url=config.OPENSOURCE_BASE_URL,
+                    api_key=config.get_opensource_api_key(),
+                )
+        self.client = client
+
+        # Resolve the actual model ID for openai_compat (may auto-discover).
+        if backend == "openai_compat" and not model:
+            self.model = config.resolve_opensource_model(client)
+
+        self._openai_tools = _to_openai_tools(TOOL_SCHEMAS)
+
     def run(self, query: str) -> AgentResult:
-        """Execute the ReAct loop for a single user query and return a result."""
-        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
         result = AgentResult(query=query, model=self.model, answer="")
         start = time.perf_counter()
+        if self.backend == "anthropic":
+            self._run_anthropic(query, result)
+        else:
+            try:
+                self._run_openai(query, result)
+            except Exception as exc:
+                result.transcript.append({
+                    "role": "system",
+                    "text": f"function calling unavailable ({exc}); using retrieval-augmented fallback",
+                })
+                self._run_rag_fallback(query, result)
+        result.latency_s = time.perf_counter() - start
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Anthropic path
+    # ------------------------------------------------------------------ #
+    def _run_anthropic(self, query: str, result: AgentResult) -> None:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
 
         for _ in range(self.max_iterations):
             result.iterations += 1
@@ -74,56 +147,141 @@ class PolicyResearchAgent:
                 tools=TOOL_SCHEMAS,
                 messages=messages,
             )
-
-            # Accumulate token usage across every turn of the loop.
             result.input_tokens += response.usage.input_tokens
             result.output_tokens += response.usage.output_tokens
             result.stop_reason = response.stop_reason
 
-            # Record assistant text from this turn (reasoning / final answer).
             assistant_text = "".join(
                 b.text for b in response.content if b.type == "text"
             )
             if assistant_text:
                 result.transcript.append({"role": "assistant", "text": assistant_text})
 
-            # Done — Claude produced a final answer with no further tool calls.
             if response.stop_reason != "tool_use":
                 result.answer = assistant_text
-                break
+                return
 
-            # Append the assistant turn (must include the tool_use blocks).
             messages.append({"role": "assistant", "content": response.content})
 
-            # Execute every tool the model requested this turn.
             tool_results: list[dict[str, Any]] = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
                 output = self.toolbox.dispatch(block.name, block.input)
-                result.tool_calls.append(
-                    {"name": block.name, "input": block.input, "output": output}
-                )
-                result.transcript.append(
-                    {"role": "tool", "name": block.name, "input": block.input}
-                )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": output,
-                    }
-                )
-
+                result.tool_calls.append({"name": block.name, "input": block.input, "output": output})
+                result.transcript.append({"role": "tool", "name": block.name, "input": block.input})
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                })
             messages.append({"role": "user", "content": tool_results})
-        else:
-            # Loop exhausted without a final answer — fail gracefully.
-            if not result.answer:
-                result.answer = (
-                    "I was unable to complete this request within the allotted "
-                    "reasoning steps. Please try rephrasing or narrowing the "
-                    "question."
-                )
 
-        result.latency_s = time.perf_counter() - start
-        return result
+        if not result.answer:
+            result.answer = (
+                "I was unable to complete this request within the allotted "
+                "reasoning steps. Please try rephrasing or narrowing the question."
+            )
+
+    # ------------------------------------------------------------------ #
+    # OpenAI-compatible path (Databricks + londonary + any llama.cpp server)
+    # ------------------------------------------------------------------ #
+    def _run_openai(self, query: str, result: AgentResult) -> None:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": query},
+        ]
+
+        for _ in range(self.max_iterations):
+            result.iterations += 1
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=messages,
+                tools=self._openai_tools,
+                tool_choice="auto",
+            )
+            self._accumulate_openai_usage(result, response)
+            choice = response.choices[0]
+            result.stop_reason = choice.finish_reason
+            msg = choice.message
+
+            text = _THINK_RE.sub("", _content_to_str(msg.content)).strip()
+            if text:
+                result.transcript.append({"role": "assistant", "text": text})
+
+            tool_calls = getattr(msg, "tool_calls", None)
+            if not tool_calls:
+                result.answer = text
+                return
+
+            messages.append({
+                "role": "assistant",
+                "content": _content_to_str(msg.content),
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                output = self.toolbox.dispatch(tc.function.name, args)
+                result.tool_calls.append({"name": tc.function.name, "input": args, "output": output})
+                result.transcript.append({"role": "tool", "name": tc.function.name, "input": args})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+
+        if not result.answer:
+            result.answer = (
+                "I was unable to complete this request within the allotted "
+                "reasoning steps. Please try rephrasing or narrowing the question."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Fallback: retrieve in code, single grounded completion (no tool calls)
+    # ------------------------------------------------------------------ #
+    def _run_rag_fallback(self, query: str, result: AgentResult) -> None:
+        result.tool_calls.clear()
+        result.input_tokens = 0
+        result.output_tokens = 0
+        result.iterations = 1
+
+        context = self.toolbox.search_policy_documents(query)
+        result.tool_calls.append({
+            "name": "search_policy_documents",
+            "input": {"query": query},
+            "output": context,
+        })
+        user = (
+            "Use ONLY the following retrieved passages from the AI-policy "
+            "knowledge base to answer. If the question is not about AI "
+            "policy/governance, politely decline.\n\n"
+            f"PASSAGES:\n{context}\n\nQUESTION: {query}"
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user},
+            ],
+        )
+        self._accumulate_openai_usage(result, response)
+        choice = response.choices[0]
+        result.stop_reason = choice.finish_reason
+        result.answer = _THINK_RE.sub("", _content_to_str(choice.message.content)).strip()
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _accumulate_openai_usage(result: AgentResult, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            result.input_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            result.output_tokens += getattr(usage, "completion_tokens", 0) or 0

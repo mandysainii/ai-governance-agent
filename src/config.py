@@ -116,7 +116,9 @@ DATABRICKS_PRIMARY_ENDPOINT = os.environ.get(
 OPENSOURCE_BASE_URL = os.environ.get(
     "OPENSOURCE_BASE_URL", "https://llm.londonary.com/v1"
 )
-OPENSOURCE_MODEL = os.environ.get("OPENSOURCE_MODEL", "")
+# Exact model id served by llm.londonary.com. Must match the server's id
+# precisely or the request 404s. Override via the OPENSOURCE_MODEL env var.
+OPENSOURCE_MODEL = os.environ.get("OPENSOURCE_MODEL", "Qwen_Qwen3.6-35B-A3B-Q4_0")
 OPENSOURCE_INFRA_USD_PER_HOUR = float(
     os.environ.get("OPENSOURCE_INFRA_USD_PER_HOUR", "0.0")
 )
@@ -285,8 +287,27 @@ def create_agent(key: str, toolbox):
         )
 
     if backend == "openai_compat":
+        import httpx
         from openai import OpenAI
-        client = OpenAI(base_url=OPENSOURCE_BASE_URL, api_key=get_opensource_api_key())
+        # llama.cpp is not OpenAI — the SDK's stainless fingerprint headers
+        # trigger Cloudflare bot detection from cloud egress IPs. Override the
+        # User-Agent and strip stainless headers via a custom httpx client.
+        http = httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)",
+                "x-stainless-lang": "",
+                "x-stainless-package-version": "",
+                "x-stainless-runtime": "",
+                "x-stainless-runtime-version": "",
+                "x-stainless-os": "",
+                "x-stainless-arch": "",
+            }
+        )
+        client = OpenAI(
+            base_url=OPENSOURCE_BASE_URL,
+            api_key=get_opensource_api_key(),
+            http_client=http,
+        )
         return PolicyResearchAgent(toolbox, client=client, backend="openai_compat")
 
     raise ValueError(f"Unknown backend '{backend}' for key '{key}'")
@@ -362,4 +383,4 @@ def resolve_opensource_model(client) -> str:
             return ids[0]
     except Exception:
         pass
-    return "qwen3.6"
+    return "Qwen_Qwen3.6-35B-A3B-Q4_0"

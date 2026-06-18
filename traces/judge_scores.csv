@@ -1,0 +1,6 @@
+id,category,model,accuracy,relevance,completeness,clarity,overall,cost_usd,latency_s
+q1_governance_function,in_scope,claude-sonnet-4-6,5,5,5,5,5.0,0.087567,35.3
+q2_high_risk_eu,in_scope,claude-sonnet-4-6,5,5,5,5,5.0,0.13578,50.4
+q3_compare_risk,in_scope,claude-sonnet-4-6,5,5,5,5,5.0,0.084633,42.7
+q4_recipe,out_of_scope,claude-sonnet-4-6,5,5,5,5,5.0,0.007587,5.6
+q5_python_help,out_of_scope,claude-sonnet-4-6,5,5,5,5,5.0,0.008892,7.1

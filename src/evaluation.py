@@ -148,23 +148,27 @@ def judge_response(
     )
 
     if backend == "anthropic":
-        response = client.messages.create(
-            model=judge_model,
-            max_tokens=512,
-            system=_JUDGE_SYSTEM,
-            messages=[{"role": "user", "content": user_block}],
+        response = config.call_with_retry(
+            lambda: client.messages.create(
+                model=judge_model,
+                max_tokens=512,
+                system=_JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": user_block}],
+            )
         )
         raw = "".join(b.text for b in response.content if b.type == "text")
         in_tok = response.usage.input_tokens
         out_tok = response.usage.output_tokens
     else:
-        response = client.chat.completions.create(
-            model=judge_model,
-            max_tokens=512,
-            messages=[
-                {"role": "system", "content": _JUDGE_SYSTEM},
-                {"role": "user", "content": user_block},
-            ],
+        response = config.call_with_retry(
+            lambda: client.chat.completions.create(
+                model=judge_model,
+                max_tokens=512,
+                messages=[
+                    {"role": "system", "content": _JUDGE_SYSTEM},
+                    {"role": "user", "content": user_block},
+                ],
+            )
         )
         raw = _content_to_str(response.choices[0].message.content)
         usage = getattr(response, "usage", None)
@@ -207,8 +211,20 @@ def _extract_json(text: str) -> dict[str, Any]:
 # Cost / ROI helpers.
 # --------------------------------------------------------------------------- #
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """USD cost for a given token usage at the configured per-1M pricing."""
+    """USD cost for a given token usage at the configured per-1M pricing.
+
+    Exact match against MODEL_PRICING (Anthropic) wins. Otherwise we fall back
+    to OSS_REFERENCE_PRICING by matching the model-family substring (e.g.
+    'gpt-oss-120b', 'qwen', 'llama') so Databricks-hosted and self-hosted
+    endpoints get a finite estimated cost for the ROI comparison instead of $0.
+    """
     pricing = config.MODEL_PRICING.get(model)
+    if pricing is None:
+        lname = (model or "").lower()
+        for family, ref in config.OSS_REFERENCE_PRICING.items():
+            if family in lname:
+                pricing = ref
+                break
     if pricing is None:
         return 0.0
     return (

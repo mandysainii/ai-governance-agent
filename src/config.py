@@ -11,6 +11,7 @@ code comments. See README.md for the full disclosure.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -82,21 +83,30 @@ PRIMARY_MODEL = "claude-sonnet-4-6"
 SECONDARY_MODEL = "claude-haiku-4-5-20251001"
 
 # USD per 1,000,000 tokens. Source: Anthropic pricing (cached 2026-05).
-# Databricks and self-hosted endpoints have $0 marginal per-token cost.
 MODEL_PRICING = {
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
 
+# Estimated reference pricing (USD per 1,000,000 tokens) for the OSS models.
+# Databricks-hosted and self-hosted endpoints don't surface per-token billing
+# (their real cost is fixed cluster/GPU infra), so quality-per-dollar would be
+# infinite. To make the ROI comparison meaningful we estimate cost from the
+# measured token counts using *published list prices for the equivalent hosted
+# model*. These are APPROXIMATE — replace with your real billed rates if known.
+# estimate_cost() matches a model id to an entry by family substring.
+OSS_REFERENCE_PRICING = {
+    "gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    "qwen":         {"input": 0.20, "output": 0.60},
+    "llama":        {"input": 0.10, "output": 0.30},
+}
+
 # --------------------------------------------------------------------------- #
-# Databricks endpoints — two OSS models for the head-to-head comparison.
-# Override via env vars if your workspace uses different endpoint names.
+# Databricks endpoint — the hosted GPT-OSS model for the head-to-head.
+# Override via env var if your workspace uses a different endpoint name.
 # --------------------------------------------------------------------------- #
 DATABRICKS_PRIMARY_ENDPOINT = os.environ.get(
     "DATABRICKS_PRIMARY_ENDPOINT", "databricks-gpt-oss-120b"
-)
-DATABRICKS_SECONDARY_ENDPOINT = os.environ.get(
-    "DATABRICKS_SECONDARY_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
 )
 
 # --------------------------------------------------------------------------- #
@@ -106,7 +116,9 @@ DATABRICKS_SECONDARY_ENDPOINT = os.environ.get(
 OPENSOURCE_BASE_URL = os.environ.get(
     "OPENSOURCE_BASE_URL", "https://llm.londonary.com/v1"
 )
-OPENSOURCE_MODEL = os.environ.get("OPENSOURCE_MODEL", "")
+# Exact model id served by llm.londonary.com. Must match the server's id
+# precisely or the request 404s. Override via the OPENSOURCE_MODEL env var.
+OPENSOURCE_MODEL = os.environ.get("OPENSOURCE_MODEL", "Qwen_Qwen3.6-35B-A3B-Q4_0")
 OPENSOURCE_INFRA_USD_PER_HOUR = float(
     os.environ.get("OPENSOURCE_INFRA_USD_PER_HOUR", "0.0")
 )
@@ -139,11 +151,6 @@ LLM_REGISTRY: dict = {
         "backend": "databricks",
         "endpoint": DATABRICKS_PRIMARY_ENDPOINT,
     },
-    "db_secondary": {
-        "label": f"Databricks / {DATABRICKS_SECONDARY_ENDPOINT}",
-        "backend": "databricks",
-        "endpoint": DATABRICKS_SECONDARY_ENDPOINT,
-    },
     "opensource": {
         "label": "Qwen 3.6 (llm.londonary.com)",
         "backend": "openai_compat",
@@ -162,17 +169,31 @@ if _has_anthropic:
         "model": SECONDARY_MODEL,
     }
 
-# Keys used for the head-to-head trace. Both Databricks models + londonary run
-# always; Claude is added when the key is available.
-EVAL_HEAD_TO_HEAD_KEYS: list = ["db_primary", "db_secondary", "opensource"]
+# Keys used for the head-to-head trace. We compare four models:
+#   1. Databricks GPT-OSS  2. Claude Sonnet  3. Claude Haiku  4. Qwen 3.6 (self-hosted)
+# Databricks + Qwen always run; the two Claude models are added when the
+# ANTHROPIC_API_KEY is available.
+EVAL_HEAD_TO_HEAD_KEYS: list = ["db_primary"]
 if _has_anthropic:
-    EVAL_HEAD_TO_HEAD_KEYS.append("sonnet")
+    EVAL_HEAD_TO_HEAD_KEYS += ["sonnet", "haiku"]
+EVAL_HEAD_TO_HEAD_KEYS.append("opensource")
+
+# --------------------------------------------------------------------------- #
+# Rate-limit handling.
+# Every LLM call (agents + judge) is wrapped in call_with_retry(), which sleeps
+# RATE_LIMIT_SLEEP_S seconds and retries on a rate-limit (HTTP 429) error.
+# --------------------------------------------------------------------------- #
+RATE_LIMIT_SLEEP_S = 10
+RATE_LIMIT_MAX_RETRIES = 5
 
 # --------------------------------------------------------------------------- #
 # Agent behavior.
 # --------------------------------------------------------------------------- #
 MAX_TOKENS = 2048
-MAX_AGENT_ITERATIONS = 6   # safety cap on the ReAct tool loop
+# Safety cap on the ReAct tool loop. Comparative questions (e.g. "how do NIST
+# and the EU AI Act differ?") need several searches; if the cap is still hit,
+# the agent forces a final tool-free synthesis turn instead of giving up.
+MAX_AGENT_ITERATIONS = 8
 TOP_K_RESULTS = 4          # chunks returned per semantic search
 
 SYSTEM_PROMPT = """You are the AI Policy Research Assistant for Meridian \
@@ -266,8 +287,27 @@ def create_agent(key: str, toolbox):
         )
 
     if backend == "openai_compat":
+        import httpx
         from openai import OpenAI
-        client = OpenAI(base_url=OPENSOURCE_BASE_URL, api_key=get_opensource_api_key())
+        # llama.cpp is not OpenAI — the SDK's stainless fingerprint headers
+        # trigger Cloudflare bot detection from cloud egress IPs. Override the
+        # User-Agent and strip stainless headers via a custom httpx client.
+        http = httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)",
+                "x-stainless-lang": "",
+                "x-stainless-package-version": "",
+                "x-stainless-runtime": "",
+                "x-stainless-runtime-version": "",
+                "x-stainless-os": "",
+                "x-stainless-arch": "",
+            }
+        )
+        client = OpenAI(
+            base_url=OPENSOURCE_BASE_URL,
+            api_key=get_opensource_api_key(),
+            http_client=http,
+        )
         return PolicyResearchAgent(toolbox, client=client, backend="openai_compat")
 
     raise ValueError(f"Unknown backend '{backend}' for key '{key}'")
@@ -286,6 +326,48 @@ def get_opensource_api_key() -> str:
     )
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True if an exception looks like a rate-limit / HTTP 429 from any backend.
+
+    Works across Anthropic (anthropic.RateLimitError), OpenAI/Databricks
+    (openai.RateLimitError), and self-hosted OpenAI-compatible servers that
+    surface 429 via status_code or the error message.
+    """
+    if "RateLimit" in type(exc).__name__:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if status == 429:
+        return True
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+
+def call_with_retry(
+    fn,
+    *,
+    max_retries: int = RATE_LIMIT_MAX_RETRIES,
+    sleep_s: int = RATE_LIMIT_SLEEP_S,
+):
+    """Call fn(), retrying on rate-limit errors after sleeping sleep_s seconds.
+
+    Non-rate-limit exceptions propagate immediately. After max_retries
+    exhausted rate-limit retries, the last error is re-raised.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                raise
+            attempt += 1
+            print(
+                f"Rate limited ({type(exc).__name__}); sleeping {sleep_s}s then "
+                f"retrying ({attempt}/{max_retries})..."
+            )
+            time.sleep(sleep_s)
+
+
 def resolve_opensource_model(client) -> str:
     """Return the open-source model id, auto-discovering it if not configured.
 
@@ -301,4 +383,4 @@ def resolve_opensource_model(client) -> str:
             return ids[0]
     except Exception:
         pass
-    return "qwen3.6"
+    return "Qwen_Qwen3.6-35B-A3B-Q4_0"

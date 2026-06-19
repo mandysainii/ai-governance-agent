@@ -68,6 +68,42 @@ IN_SCOPE_QUERIES = [
         "category": "in_scope",
         "head_to_head": False,
     },
+    {
+        "id": "q6_genai_risks",
+        "query": (
+            "What unique risks does NIST AI 600-1 identify for generative AI "
+            "systems, and how does it recommend organizations address them?"
+        ),
+        "category": "in_scope",
+        "head_to_head": False,
+    },
+    {
+        "id": "q7_genai_vs_rmf",
+        "query": (
+            "How does the NIST AI 600-1 Generative AI Profile relate to and "
+            "extend the core NIST AI RMF 1.0? What gaps does it fill?"
+        ),
+        "category": "in_scope",
+        "head_to_head": False,
+    },
+    {
+        "id": "q8_prohibited_eu",
+        "query": (
+            "What AI practices does the EU AI Act explicitly prohibit, and what "
+            "is the rationale given for each prohibition?"
+        ),
+        "category": "in_scope",
+        "head_to_head": False,
+    },
+    {
+        "id": "q9_transparency",
+        "query": (
+            "How do the NIST AI RMF and EU AI Act each address transparency "
+            "and explainability requirements for AI systems?"
+        ),
+        "category": "in_scope",
+        "head_to_head": False,
+    },
 ]
 
 OUT_OF_SCOPE_QUERIES = [
@@ -82,6 +118,15 @@ OUT_OF_SCOPE_QUERIES = [
         "query": (
             "Write me a Python function that reverses a linked list and explain "
             "the time complexity."
+        ),
+        "category": "out_of_scope",
+        "head_to_head": False,
+    },
+    {
+        "id": "q10_stock_advice",
+        "query": (
+            "Which tech stocks should I invest in right now given the current "
+            "market conditions?"
         ),
         "category": "out_of_scope",
         "head_to_head": False,
@@ -187,6 +232,116 @@ def judge_response(
         rationale=str(data.get("rationale", "")),
         judge_input_tokens=in_tok,
         judge_output_tokens=out_tok,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Rubric thresholds.
+# --------------------------------------------------------------------------- #
+PASS_THRESHOLD = 3.0
+
+
+def passes_rubric(score: JudgeScore) -> dict[str, bool]:
+    """Return a per-dimension and overall pass/fail for a judge score.
+
+    Any dimension below PASS_THRESHOLD is a fail. Use this to flag traces
+    that need human review before a production deployment decision.
+    """
+    dims = ["accuracy", "relevance", "completeness", "clarity"]
+    result = {d: getattr(score, d) >= PASS_THRESHOLD for d in dims}
+    result["overall"] = score.overall >= PASS_THRESHOLD
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Groundedness check.
+# --------------------------------------------------------------------------- #
+_GROUNDEDNESS_SYSTEM = """You are evaluating whether an AI assistant's answer \
+is grounded in the source documents provided to it.
+
+You will receive:
+  1. The user's question.
+  2. The retrieved context chunks the assistant had access to.
+  3. The assistant's answer.
+
+Score groundedness from 1 to 5:
+  5 — Every substantive claim traces directly to the provided context. \
+Citations (article numbers, section names, function names) match the chunks.
+  4 — Most claims are grounded; one minor point may come from general \
+knowledge but does not change the answer.
+  3 — The answer is broadly consistent with the context but several specific \
+claims are not supported by the retrieved chunks.
+  2 — The answer mixes grounded claims with clear hallucinations or \
+unsupported specifics.
+  1 — The answer is largely or entirely unsupported by the retrieved context.
+
+SPECIAL CASE: If the context chunks are empty or the question is out-of-scope \
+and the assistant correctly declined, return a score of 5 with rationale \
+"Correct refusal; groundedness check not applicable."
+
+Return ONLY a JSON object with this exact shape and nothing else:
+{"groundedness": int, "rationale": "one or two sentences"}"""
+
+
+@dataclass
+class GroundednessScore:
+    groundedness: int
+    rationale: str
+    passes: bool = False
+
+    def __post_init__(self):
+        self.passes = self.groundedness >= PASS_THRESHOLD
+
+
+def groundedness_score(
+    client,
+    query: str,
+    answer: str,
+    retrieved_chunks: list[str],
+    judge_model: str = config.JUDGE_MODEL,
+    backend: str = config.JUDGE_BACKEND,
+) -> GroundednessScore:
+    """Score how well the answer is grounded in the retrieved context chunks.
+
+    Pass retrieved_chunks as a list of strings (the raw text of each chunk
+    returned by the vector search tool). If the list is empty the judge will
+    apply the out-of-scope special case.
+    """
+    context_block = "\n\n---\n\n".join(retrieved_chunks) if retrieved_chunks else "(none)"
+    user_block = (
+        f"USER QUESTION:\n{query}\n\n"
+        f"RETRIEVED CONTEXT:\n{context_block}\n\n"
+        f"ASSISTANT ANSWER:\n{answer}\n\n"
+        "Score the groundedness now. Return only the JSON object."
+    )
+
+    if backend == "anthropic":
+        response = config.call_with_retry(
+            lambda: client.messages.create(
+                model=judge_model,
+                max_tokens=256,
+                system=_GROUNDEDNESS_SYSTEM,
+                messages=[{"role": "user", "content": user_block}],
+            )
+        )
+        raw = "".join(b.text for b in response.content if b.type == "text")
+    else:
+        response = config.call_with_retry(
+            lambda: client.chat.completions.create(
+                model=judge_model,
+                max_tokens=256,
+                messages=[
+                    {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
+                    {"role": "user", "content": user_block},
+                ],
+            )
+        )
+        raw = _content_to_str(response.choices[0].message.content)
+
+    data = _extract_json(raw)
+    return GroundednessScore(
+        groundedness=int(data.get("groundedness", 0)),
+        rationale=str(data.get("rationale", "")),
     )
 
 

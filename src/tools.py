@@ -19,12 +19,58 @@ the retrieval logic and schemas were reviewed by the author.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
 
 from . import config
 from .vector_store import SimpleVectorStore
+
+# Optional MLflow tracing. When mlflow is present (Databricks), each retrieval
+# emits a RETRIEVER span whose output is the retrieved chunks as Documents —
+# this is what mlflow.genai's built-in RetrievalGroundedness scorer reads to
+# check the answer is backed by the passages. When mlflow is absent (local
+# runs, the self-check), this degrades to a no-op so nothing else changes.
+try:
+    import mlflow as _mlflow
+
+    try:
+        from mlflow.entities import Document as _MLflowDocument
+    except Exception:  # older mlflow without Document
+        _MLflowDocument = None
+    _MLFLOW_AVAILABLE = True
+except Exception:
+    _mlflow = None
+    _MLflowDocument = None
+    _MLFLOW_AVAILABLE = False
+
+
+def _to_documents(hits: list[dict[str, Any]]) -> list[Any]:
+    """Render retrieved hits as MLflow Documents (or plain dicts on old mlflow)."""
+    docs: list[Any] = []
+    for i, h in enumerate(hits):
+        text = h.get("text", "")
+        meta = {k: v for k, v in h.items() if k != "text"}
+        if _MLflowDocument is not None:
+            docs.append(_MLflowDocument(id=str(i), page_content=text, metadata=meta))
+        else:
+            docs.append({"id": str(i), "page_content": text, "metadata": meta})
+    return docs
+
+
+@contextmanager
+def _retriever_span(name: str, query: str):
+    """Yield a ``record(hits)`` callback that logs hits to a RETRIEVER span.
+
+    No-op (the callback does nothing) when mlflow is unavailable.
+    """
+    if not _MLFLOW_AVAILABLE:
+        yield lambda hits: None
+        return
+    with _mlflow.start_span(name=name, span_type="RETRIEVER") as span:
+        span.set_inputs({"query": query})
+        yield lambda hits: span.set_outputs(_to_documents(hits))
 
 
 class PolicyToolbox:
@@ -65,8 +111,10 @@ class PolicyToolbox:
     # --------------------------------------------------------------------- #
     def search_policy_documents(self, query: str, top_k: int | None = None) -> str:
         k = top_k or config.TOP_K_RESULTS
-        hits = self.store.search(self._embed(query), top_k=k)
-        return self._format_hits(hits)
+        with _retriever_span("search_policy_documents", query) as record:
+            hits = self.store.search(self._embed(query), top_k=k)
+            record(hits)
+            return self._format_hits(hits)
 
     # --------------------------------------------------------------------- #
     # Tool 2: compare how two frameworks treat the same topic.
@@ -74,21 +122,25 @@ class PolicyToolbox:
     def compare_frameworks(self, topic: str, doc_id_a: str, doc_id_b: str) -> str:
         per_doc = max(2, config.TOP_K_RESULTS // 2)
         q = self._embed(topic)
-        hits_a = self.store.search(q, top_k=per_doc, doc_id=doc_id_a)
-        hits_b = self.store.search(q, top_k=per_doc, doc_id=doc_id_b)
-        name_a = config.DOC_SHORT_NAMES.get(doc_id_a, doc_id_a)
-        name_b = config.DOC_SHORT_NAMES.get(doc_id_b, doc_id_b)
-        return (
-            f"=== {name_a} on '{topic}' ===\n{self._format_hits(hits_a)}\n\n"
-            f"=== {name_b} on '{topic}' ===\n{self._format_hits(hits_b)}"
-        )
+        with _retriever_span("compare_frameworks", topic) as record:
+            hits_a = self.store.search(q, top_k=per_doc, doc_id=doc_id_a)
+            hits_b = self.store.search(q, top_k=per_doc, doc_id=doc_id_b)
+            record(hits_a + hits_b)
+            name_a = config.DOC_SHORT_NAMES.get(doc_id_a, doc_id_a)
+            name_b = config.DOC_SHORT_NAMES.get(doc_id_b, doc_id_b)
+            return (
+                f"=== {name_a} on '{topic}' ===\n{self._format_hits(hits_a)}\n\n"
+                f"=== {name_b} on '{topic}' ===\n{self._format_hits(hits_b)}"
+            )
 
     # --------------------------------------------------------------------- #
     # Tool 3: gather the strongest evidence for a single topic (deeper recall).
     # --------------------------------------------------------------------- #
     def summarize_policy_topic(self, topic: str) -> str:
-        hits = self.store.search(self._embed(topic), top_k=config.TOP_K_RESULTS + 2)
-        return self._format_hits(hits)
+        with _retriever_span("summarize_policy_topic", topic) as record:
+            hits = self.store.search(self._embed(topic), top_k=config.TOP_K_RESULTS + 2)
+            record(hits)
+            return self._format_hits(hits)
 
     # --------------------------------------------------------------------- #
     # Dispatch: route a tool_use block from the agent to the right method.
@@ -174,25 +226,31 @@ class DatabricksVSToolbox:
         return "\n\n".join(lines)
 
     def search_policy_documents(self, query: str, top_k: int | None = None) -> str:
-        hits = self._search_raw(query, top_k or config.TOP_K_RESULTS)
-        return self._format_hits(hits)
+        with _retriever_span("search_policy_documents", query) as record:
+            hits = self._search_raw(query, top_k or config.TOP_K_RESULTS)
+            record(hits)
+            return self._format_hits(hits)
 
     def compare_frameworks(self, topic: str, doc_id_a: str, doc_id_b: str) -> str:
         per_doc = max(2, config.TOP_K_RESULTS // 2)
         src_a = _DOC_ID_TO_SOURCE.get(doc_id_a, doc_id_a)
         src_b = _DOC_ID_TO_SOURCE.get(doc_id_b, doc_id_b)
-        hits_a = self._search_raw(topic, per_doc, source_filter=src_a)
-        hits_b = self._search_raw(topic, per_doc, source_filter=src_b)
-        name_a = config.DOC_SHORT_NAMES.get(doc_id_a, doc_id_a)
-        name_b = config.DOC_SHORT_NAMES.get(doc_id_b, doc_id_b)
-        return (
-            f"=== {name_a} on '{topic}' ===\n{self._format_hits(hits_a)}\n\n"
-            f"=== {name_b} on '{topic}' ===\n{self._format_hits(hits_b)}"
-        )
+        with _retriever_span("compare_frameworks", topic) as record:
+            hits_a = self._search_raw(topic, per_doc, source_filter=src_a)
+            hits_b = self._search_raw(topic, per_doc, source_filter=src_b)
+            record(hits_a + hits_b)
+            name_a = config.DOC_SHORT_NAMES.get(doc_id_a, doc_id_a)
+            name_b = config.DOC_SHORT_NAMES.get(doc_id_b, doc_id_b)
+            return (
+                f"=== {name_a} on '{topic}' ===\n{self._format_hits(hits_a)}\n\n"
+                f"=== {name_b} on '{topic}' ===\n{self._format_hits(hits_b)}"
+            )
 
     def summarize_policy_topic(self, topic: str) -> str:
-        hits = self._search_raw(topic, config.TOP_K_RESULTS + 2)
-        return self._format_hits(hits)
+        with _retriever_span("summarize_policy_topic", topic) as record:
+            hits = self._search_raw(topic, config.TOP_K_RESULTS + 2)
+            record(hits)
+            return self._format_hits(hits)
 
     def dispatch(self, tool_name: str, tool_input: dict[str, Any]) -> str:
         try:
